@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/getsentry/sentry-go"
 )
 
 // Version is the agent build version, stamped at build time via -ldflags "-X main.Version=<v>".
@@ -24,6 +26,10 @@ func getenv(k, def string) string {
 
 func main() {
 	log.Printf("culipulse-agent %s starting", Version)
+	if initSentry() {
+		defer sentry.Flush(2 * time.Second)
+		log.Printf("culipulse-agent: sentry telemetry enabled")
+	}
 	base := os.Getenv("CULIPULSE_API_URL")
 	token := os.Getenv("CULIPULSE_AGENT_TOKEN")
 	if base == "" || token == "" {

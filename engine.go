@@ -4,10 +4,34 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/getsentry/sentry-go"
 )
+
+// captureLoopPanic reports a recovered main-loop panic to Sentry, tagged so issues group per loop.
+// Total + safe: when Sentry is not initialized (empty SENTRY_DSN — the default), the current hub has
+// no client and Recover no-ops, so this makes no network calls and never affects the restart path.
+func captureLoopPanic(name string, r any) {
+	// Clone the hub: the main loops run in separate goroutines, and the global hub has a single shared
+	// scope stack — a clone gives this capture its own scope (sharing the client) so concurrent panics
+	// in two loops can't cross-tag each other's events. This is sentry-go's documented goroutine pattern.
+	hub := sentry.CurrentHub().Clone()
+	hub.WithScope(func(scope *sentry.Scope) {
+		scope.SetTag("loop", name)
+		scope.SetTag("arch", runtime.GOARCH)
+		scope.SetTag("version", Version)
+		if reg := os.Getenv("CULIPULSE_AGENT_REGION"); reg != "" {
+			scope.SetTag("region", reg)
+		}
+		hub.Recover(r)
+	})
+}
 
 // engineStats holds cumulative pipeline counters, incremented from the pull/schedule/ingest
 // goroutines and snapshotted by the summary loop to log periodic activity.
@@ -120,6 +144,82 @@ func dispatchDiagnose(resp *PullResponse, seen map[string]bool, probe func(WorkI
 	return out
 }
 
+// runRecovered runs fn under panic recovery: a panic is logged (name-tagged, with the panic value and
+// stack) instead of crashing the process. Returns true if fn panicked (and was recovered), false if fn
+// returned normally — callers that need to keep a loop alive use this to decide whether to restart.
+func runRecovered(name string, fn func()) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("goroutine panic recovered name=%s: %v\n%s", name, r, debug.Stack())
+			captureLoopPanic(name, r)
+			panicked = true
+		}
+	}()
+	fn()
+	return false
+}
+
+// safeGo runs fn once in a new goroutine under panic recovery (see runRecovered): a panic in fn is
+// logged and does not crash the process, but fn is not restarted. Use for goroutines that are meant to
+// run to completion once (e.g. a one-shot task), not for a main loop that must keep running.
+func safeGo(name string, fn func()) {
+	go runRecovered(name, fn)
+}
+
+// restartBackoff bounds how often a panicking main loop is restarted, so a deterministic panic (e.g. a
+// bug hit on every tick) can't spin the CPU in a tight crash loop. A var (not const) so tests can
+// shrink it instead of waiting out the real delay.
+var restartBackoff = time.Second
+
+// A deterministic panic (same input crashes every tick) would otherwise spin restartOnPanic forever
+// at restartBackoff, leaving the process "up" to its supervisor while doing no probing — harder to
+// notice than a clean crash. maxRestartsInWindow/restartWindow bound that: exceeding the cap exits the
+// process so docker's --restart=unless-stopped restarts it fresh (and the per-panic Sentry report has
+// already fired). Vars, not consts, so tests can shrink them. exitProcess is overridable for tests.
+var (
+	maxRestartsInWindow = 5
+	restartWindow       = time.Minute
+	exitProcess         = os.Exit
+)
+
+// restartOnPanic runs fn, and if fn panics, recovers, logs (via runRecovered), waits restartBackoff,
+// and re-invokes fn — so a main-loop goroutine (pull/schedule/ingest/stats) keeps running after a
+// recovered panic instead of silently going quiet for the rest of the process's life, which would be
+// worse than a clean crash (the agent looks alive but stops doing its job). fn must return only on a
+// clean shutdown (e.g. ctx.Done()); a normal return stops the retries for good. Runs synchronously in
+// the calling goroutine — callers that want this in its own goroutine use safeLoop.
+func restartOnPanic(name string, fn func()) {
+	var panics []time.Time
+	for {
+		if !runRecovered(name, fn) {
+			return // clean return (e.g. ctx.Done) — stop restarting for good
+		}
+		now := time.Now()
+		cutoff := now.Add(-restartWindow)
+		kept := panics[:0]
+		for _, ts := range panics {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		panics = append(kept, now)
+		if len(panics) > maxRestartsInWindow {
+			log.Printf("goroutine %q panicked %d times within %s — exiting for a clean supervisor restart instead of a silent restart loop", name, len(panics), restartWindow)
+			sentry.Flush(2 * time.Second) // best-effort; no-op when Sentry disabled
+			exitProcess(1)
+			return // reached only in tests where exitProcess doesn't exit; avoids spinning
+		}
+		time.Sleep(restartBackoff)
+	}
+}
+
+// safeLoop is restartOnPanic launched in its own goroutine — the long-running-loop counterpart to
+// safeGo: a panic is recovered, logged, and the loop is restarted (after restartBackoff) rather than
+// left dead for the rest of the process's life.
+func safeLoop(name string, fn func()) {
+	go restartOnPanic(name, fn)
+}
+
 func runEngine(ctx context.Context, pull func(context.Context) (*PullResponse, error), ingest ingestFunc, probeFn probeFunc, cfg engineConfig) {
 	jobs := make(chan WorkItem, cfg.maxConcurrency)
 	results := make(chan IngestResult, cfg.maxConcurrency*2)
@@ -138,26 +238,35 @@ func runEngine(ctx context.Context, pull func(context.Context) (*PullResponse, e
 		}()
 	}
 
-	// Ingester: batches results and POSTs them, decoupled from probing.
+	// Ingester: batches results and POSTs them, decoupled from probing. restartOnPanic keeps it
+	// pulling from `results` after a recovered panic instead of stalling ingest for good while the
+	// process stays alive (see runRecovered/restartOnPanic).
 	var ingester sync.WaitGroup
 	ingester.Add(1)
 	go func() {
 		defer ingester.Done()
-		ingestLoop(ingest, results, cfg, stats)
+		restartOnPanic("ingest", func() { ingestLoop(ingest, results, cfg, stats) })
 	}()
 
-	// Pull: refresh the work list on its own cadence, never blocked by probing/ingest.
+	// Pull: refresh the work list on its own cadence, never blocked by probing/ingest. Long-running
+	// for{} loop, so safeLoop restarts it on a recovered panic (see restartOnPanic).
 	// Diagnose items are probed inline in pullLoop (bypassing the shared jobs/results channels to avoid
 	// send-on-closed-channel races) using probeDiagnose for fresh-connection one-shot probes.
-	go pullLoop(ctx, pull, ingest, probeDiagnose, cfg, updates, stats)
+	safeLoop("pull", func() { pullLoop(ctx, pull, ingest, probeDiagnose, cfg, updates, stats) })
 
-	// Optional periodic activity summary (operator visibility).
+	// Optional periodic activity summary (operator visibility). Long-running for{} loop; restart on
+	// panic like the other main loops.
 	if cfg.summaryInterval > 0 {
-		go statsLoop(ctx, stats, cfg.summaryInterval)
+		safeLoop("stats", func() { statsLoop(ctx, stats, cfg.summaryInterval) })
 	}
 
-	// Scheduler runs in this goroutine, so runEngine blocks until ctx is cancelled.
-	scheduleLoop(ctx, cfg, updates, jobs, results, stats) // sole sender to jobs; closes it on return
+	// Scheduler runs in this goroutine, so runEngine blocks until ctx is cancelled. restartOnPanic
+	// keeps scheduling alive across a recovered panic; jobs is closed exactly once here (not inside
+	// scheduleLoop) so a restart never double-closes it.
+	restartOnPanic("schedule", func() {
+		scheduleLoop(ctx, cfg, updates, jobs, results, stats)
+	})
+	close(jobs) // sole sender to jobs; closed once scheduleLoop returns cleanly (ctx.Done())
 
 	workers.Wait()  // workers drain remaining jobs and exit
 	close(results)  // safe: scheduler (abstains) returned and all workers are done
@@ -201,8 +310,9 @@ func pullLoop(ctx context.Context, pull func(context.Context) (*PullResponse, er
 	}
 }
 
+// scheduleLoop does not close jobs itself (a restart via restartOnPanic would double-close it) — the
+// caller in runEngine closes jobs exactly once, after scheduleLoop returns cleanly on ctx.Done().
 func scheduleLoop(ctx context.Context, cfg engineConfig, updates <-chan *PullResponse, jobs chan<- WorkItem, results chan<- IngestResult, stats *engineStats) {
-	defer close(jobs) // scheduler is the only sender to jobs
 	var work []WorkItem
 	var caps []string
 	lastProbed := map[string]int64{}

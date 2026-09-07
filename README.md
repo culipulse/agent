@@ -1,9 +1,10 @@
-# CuliPulse agent
+# CuliPulse agent — uptime monitoring that also watches what's behind your firewall
 
-A small Go probe that monitors your infrastructure **from inside your own network**.
-It pulls check assignments from a CuliPulse deployment, runs them
-(`http` / `cert` / `tcp` / `icmp` / `udp`) plus optional network discovery, and reports
-the results back. Built into a distroless image by `Dockerfile`.
+A small Go probe that monitors your infrastructure **from inside your own network** — private
+services UptimeRobot and Pingdom can't reach. It pulls check assignments from a CuliPulse
+deployment, runs them (`http` / `cert` / `tcp` / `icmp` / `udp`) plus optional network
+discovery, and reports results back. Outbound-only: no inbound ports, no VPN. Built into a
+distroless image by `Dockerfile`.
 
 > **This repository is a read-only, open-source (Apache-2.0) mirror of the agent that CuliPulse
 > ships.** It is published so you can **audit exactly what runs inside your network** before
@@ -16,7 +17,9 @@ The agent is designed to be safe to run behind your firewall:
 
 - **Outbound-only.** It opens connections *out* to the CuliPulse API to fetch work and post
   results. It exposes **no inbound port** and needs **no inbound firewall rule** — nothing on
-  the internet can reach it.
+  the internet can reach it. By default the agent's only outbound destination is
+  `CULIPULSE_API_URL`; error telemetry to Sentry is **opt-in** — it happens only if you set the
+  optional `SENTRY_DSN` env var, and is off unless you do.
 - **No inbound control channel.** It is a poller: on an interval (`CULIPULSE_POLL_SECONDS`,
   default 30) it asks the API "what should I check?" There is no remote-exec / command channel,
   no shell in the image, and it never writes files from server input.
@@ -84,6 +87,7 @@ detail page → **Connect this agent**. It looks like:
 | `CULIPULSE_MAX_CONCURRENCY` | no | `100` | Max concurrent checks |
 | `CULIPULSE_SUMMARY_SECONDS` | no | `60` | Summary/heartbeat interval |
 | `CULIPULSE_DISCOVER_CIDR` | no | — | CIDR range to scan for network discovery |
+| `SENTRY_DSN` | no | — | **Optional, off by default.** If set, recovered panics are reported to this Sentry DSN (errors only). Unset = no telemetry and no calls to anything but `CULIPULSE_API_URL`. |
 
 ## Updating
 
@@ -108,8 +112,8 @@ The dashboard shows each agent's version and whether an update is available.
     go build -o culipulse-agent .        # requires Go 1.25+
     go test ./...                          # run the test suite
 
-The agent is a self-contained module (`culipulse-agent`) with no external service dependencies
-beyond the standard library and the pinned modules in `go.mod`.
+The agent depends only on the Go standard library and the modules pinned in `go.mod` (the AWS SDK,
+used only for optional AWS discovery, and `sentry-go`, used only when `SENTRY_DSN` is set).
 
 ## Source & contributing
 
