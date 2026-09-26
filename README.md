@@ -57,7 +57,7 @@ supply a protocol-correct payload for a meaningful check. The agent advertises i
 
 ## Image
 
-`ghcr.io/culiops/culipulse-agent:latest` (also tagged per commit `sha-<short>` and, on `v*`
+`ghcr.io/culipulse/agent:latest` (also tagged per commit `sha-<short>` and, on `v*`
 releases, by semver).
 
 The image is **multi-arch** (`linux/amd64` + `linux/arm64`) — `docker run …:latest` auto-selects
@@ -73,7 +73,7 @@ detail page → **Connect this agent**. It looks like:
     docker run -d --restart=unless-stopped --cap-add=NET_RAW \
       -e CULIPULSE_API_URL=https://culipulse.dev \
       -e CULIPULSE_AGENT_TOKEN=cpa_... \
-      ghcr.io/culiops/culipulse-agent:latest
+      ghcr.io/culipulse/agent:latest
 
 `--cap-add=NET_RAW` is needed only for ICMP checks; drop it otherwise.
 

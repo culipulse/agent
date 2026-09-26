@@ -72,6 +72,9 @@ func (c *Client) Pull(ctx context.Context) (*PullResponse, error) {
 	if err := c.do(ctx, "/agent/v1/pull", body, &pr); err != nil {
 		return nil, err
 	}
+	// Before returning: work items only ever arrive through this response, so this is the one place
+	// that guarantees the guard is on before anything from it is probed.
+	applyAgentKind(pr.AgentKind)
 	return &pr, nil
 }
 

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"net"
+	"errors"
 	"strings"
 	"time"
 )
@@ -28,7 +28,7 @@ func udpProbe(item WorkItem) IngestResult {
 	}
 
 	start := time.Now()
-	conn, err := net.DialTimeout("udp", item.Target, timeout)
+	conn, err := guardedDialer(timeout).Dial("udp", item.Target)
 	if err != nil {
 		c := classifyUDPError(err)
 		res.Cause = &c
@@ -71,6 +71,11 @@ func udpProbe(item WorkItem) IngestResult {
 }
 
 func classifyUDPError(err error) string {
+	// Identity check first — never string-match, which a target string containing our cause text
+	// could spoof (see classifyError in prober.go for the concrete spoof example).
+	if errors.Is(err, errBlockedTarget) {
+		return "blocked_target"
+	}
 	s := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(s, "timeout") || strings.Contains(s, "deadline") || strings.Contains(s, "i/o timeout"):

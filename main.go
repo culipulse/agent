@@ -35,6 +35,12 @@ func main() {
 	if base == "" || token == "" {
 		log.Fatal("CULIPULSE_API_URL and CULIPULSE_AGENT_TOKEN are required")
 	}
+	// Defence-in-depth: a shared-agent host sets CULIPULSE_SHARED_AGENT=1 so the dial guard is on
+	// from process start, ahead of (and independent of) whatever the server reports on the first
+	// /pull (applyAgentKind, in dialguard.go, covers that server-driven path).
+	if sharedGuardFromEnv() {
+		enableSharedGuard("env")
+	}
 	poll, _ := strconv.Atoi(getenv("CULIPULSE_POLL_SECONDS", "30"))
 	if poll <= 0 {
 		poll = 30

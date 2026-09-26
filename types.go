@@ -77,6 +77,7 @@ type PullRequest struct {
 
 type PullResponse struct {
 	AgentID      string     `json:"agentId"`
+	AgentKind    string     `json:"agentKind,omitempty"`
 	Capabilities []string   `json:"capabilities"`
 	Work         []WorkItem `json:"work"`
 	Diagnose     []WorkItem `json:"diagnose,omitempty"`

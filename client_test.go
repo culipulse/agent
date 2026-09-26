@@ -104,6 +104,71 @@ func TestPullAlwaysSendsDiscoveryKey(t *testing.T) {
 	}
 }
 
+// TestPullEnablesSharedGuardOnFirstParty is a regression guard for the load-bearing wiring: the
+// server-reported agentKind must flip the dial guard on, and it must happen inside Pull (before any
+// work items from this same response are ever probed) — not left to some later, skippable step.
+func TestPullEnablesSharedGuardOnFirstParty(t *testing.T) {
+	prev := sharedGuard.Load()
+	t.Cleanup(func() { sharedGuard.Store(prev) })
+	sharedGuard.Store(false)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"agentId":"a","agentKind":"first_party","capabilities":[],"work":[]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok")
+	if _, err := c.Pull(context.Background()); err != nil {
+		t.Fatalf("Pull returned error: %v", err)
+	}
+	if !sharedGuard.Load() {
+		t.Fatal("want sharedGuard on after a pull response reporting agentKind=first_party")
+	}
+}
+
+// TestPullLeavesSharedGuardOffForTenant proves a tenant response does not turn the guard on —
+// tenant-owned agents must keep reaching private targets, which is their job.
+func TestPullLeavesSharedGuardOffForTenant(t *testing.T) {
+	prev := sharedGuard.Load()
+	t.Cleanup(func() { sharedGuard.Store(prev) })
+	sharedGuard.Store(false)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"agentId":"a","agentKind":"tenant","capabilities":[],"work":[]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok")
+	if _, err := c.Pull(context.Background()); err != nil {
+		t.Fatalf("Pull returned error: %v", err)
+	}
+	if sharedGuard.Load() {
+		t.Fatal("want sharedGuard to stay off after a pull response reporting agentKind=tenant")
+	}
+}
+
+// TestPullKeepsSharedGuardStickyOnTenantResponse proves the guard is sticky: once on, a later pull
+// that reports "tenant" (e.g. a misconfigured server, or a race during a kind change) must never turn
+// it back off.
+func TestPullKeepsSharedGuardStickyOnTenantResponse(t *testing.T) {
+	prev := sharedGuard.Load()
+	t.Cleanup(func() { sharedGuard.Store(prev) })
+	sharedGuard.Store(true)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"agentId":"a","agentKind":"tenant","capabilities":[],"work":[]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok")
+	if _, err := c.Pull(context.Background()); err != nil {
+		t.Fatalf("Pull returned error: %v", err)
+	}
+	if !sharedGuard.Load() {
+		t.Fatal("want sharedGuard to stay on (sticky) even though this pull reported agentKind=tenant")
+	}
+}
+
 func TestDoCapsResponseBody(t *testing.T) {
 	// Valid JSON far larger than a shrunk cap: {"x":"aaaa...a"}. Capped → truncated mid-string →
 	// invalid JSON → do() errors; large cap → full parse → success. Deleting the io.LimitReader

@@ -59,3 +59,26 @@ func TestBuildDiscoveryReportZeroValueWhenNothingConfigured(t *testing.T) {
 		t.Fatalf("report = %+v, want all-empty fields when nothing is configured", report)
 	}
 }
+
+// TestSharedGuardFromEnv covers the CULIPULSE_SHARED_AGENT defence-in-depth switch: a shared-agent
+// host sets it directly in its env file so the guard is on even before the first successful /pull.
+func TestSharedGuardFromEnv(t *testing.T) {
+	t.Setenv("CULIPULSE_SHARED_AGENT", "1")
+	if !sharedGuardFromEnv() {
+		t.Fatal("want true when CULIPULSE_SHARED_AGENT=1")
+	}
+}
+
+func TestSharedGuardFromEnvExplicitZero(t *testing.T) {
+	t.Setenv("CULIPULSE_SHARED_AGENT", "0")
+	if sharedGuardFromEnv() {
+		t.Fatal("want false when CULIPULSE_SHARED_AGENT=0")
+	}
+}
+
+func TestSharedGuardFromEnvUnset(t *testing.T) {
+	t.Setenv("CULIPULSE_SHARED_AGENT", "")
+	if sharedGuardFromEnv() {
+		t.Fatal("want false when CULIPULSE_SHARED_AGENT is unset")
+	}
+}

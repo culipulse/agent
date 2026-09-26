@@ -1,7 +1,7 @@
 package main
 
 import (
-	"net"
+	"errors"
 	"strings"
 	"time"
 )
@@ -14,7 +14,7 @@ func tcpProbe(item WorkItem) IngestResult {
 	}
 	deadline := time.Now().Add(timeout)
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", item.Target, timeout)
+	conn, err := guardedDialer(timeout).Dial("tcp", item.Target)
 	if err != nil {
 		c := classifyTCPError(err)
 		res.Cause = &c
@@ -85,6 +85,11 @@ func tcpProbe(item WorkItem) IngestResult {
 }
 
 func classifyTCPError(err error) string {
+	// Identity check first — never string-match, which a target string containing our cause text
+	// could spoof (see classifyError in prober.go for the concrete spoof example).
+	if errors.Is(err, errBlockedTarget) {
+		return "blocked_target"
+	}
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "refused"):

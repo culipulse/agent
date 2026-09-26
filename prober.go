@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -65,6 +66,7 @@ var sharedTransport = &http.Transport{
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
 	TLSClientConfig:       &tls.Config{},
+	DialContext:           guardedDialer(30 * time.Second).DialContext,
 }
 
 func buildClient(item WorkItem) *http.Client {
@@ -89,6 +91,7 @@ func buildFreshClient(item WorkItem) *http.Client {
 		DisableKeepAlives:   true,
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     &tls.Config{},
+		DialContext:         guardedDialer(30 * time.Second).DialContext,
 	}
 	return &http.Client{
 		Transport: tr,
@@ -200,6 +203,12 @@ func probeWith(client *http.Client, item WorkItem) IngestResult {
 }
 
 func classifyError(err error) string {
+	// Identity check first: a target URL/host that merely CONTAINS the text "blocked_target" must
+	// never spoof this cause. errors.Is walks the wrap chain (url.Error -> net.OpError -> our
+	// sentinel), which string-matching the error text cannot distinguish from user-controlled text.
+	if errors.Is(err, errBlockedTarget) {
+		return "blocked_target"
+	}
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "certificate has expired") || strings.Contains(s, "certificate is not yet valid"):

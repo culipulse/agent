@@ -58,6 +58,11 @@ func icmpProbe(item WorkItem) IngestResult {
 		res.Cause = &c
 		return res
 	}
+	if sharedGuard.Load() && ipBlockedForShared(ipaddr.IP) {
+		c := "blocked_target"
+		res.Cause = &c
+		return res
+	}
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		c := "icmp_socket"
