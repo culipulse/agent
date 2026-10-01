@@ -92,6 +92,8 @@ func awsErr(op, region string, err error) string {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		msg = apiErr.ErrorCode() // e.g. AccessDenied, UnauthorizedOperation
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		msg = "timed out" // the SDK's wrapper text is long; truncating it would cut off the cause
 	} else if len(msg) > 120 {
 		msg = msg[:120]
 	}
@@ -110,82 +112,193 @@ func representativeError(errs []string) string {
 	}
 }
 
+// elbAPI is the slice of the ELBv2 client discovery uses — an interface so tests can serve
+// multi-page results and sub-call failures.
+type elbAPI interface {
+	elasticloadbalancingv2.DescribeLoadBalancersAPIClient
+	elasticloadbalancingv2.DescribeListenersAPIClient
+	DescribeTags(context.Context, *elasticloadbalancingv2.DescribeTagsInput, ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.DescribeTagsOutput, error)
+}
+
+// awsClients are the per-region AWS clients one collectRegion pass reads from.
+type awsClients struct {
+	elb elbAPI
+	ec2 ec2.DescribeInstancesAPIClient
+	rds rds.DescribeDBInstancesAPIClient
+}
+
+// elbTagsBatch is DescribeTags' per-call ARN limit.
+const elbTagsBatch = 20
+
 // collectAWS lists ALB/NLB, EC2, and RDS in one region and returns normalized resources.
 func collectAWS(ctx context.Context, region string) ([]CloudResource, []string) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, []string{awsErr("aws:LoadConfig", region, err)}
 	}
+	return collectRegion(ctx, region, awsClients{
+		elb: elasticloadbalancingv2.NewFromConfig(cfg),
+		ec2: ec2.NewFromConfig(cfg),
+		rds: rds.NewFromConfig(cfg),
+	})
+}
+
+// collectRegion reads every page of every service. A failed page or sub-call is reported in errs —
+// the server then closes nothing for this scan — so a partial scan never looks clean.
+func collectRegion(ctx context.Context, region string, c awsClients) ([]CloudResource, []string) {
 	var out []CloudResource
 	var errs []string
+	for _, collect := range []func() ([]CloudResource, []string){
+		func() ([]CloudResource, []string) { return collectLoadBalancers(ctx, region, c.elb) },
+		func() ([]CloudResource, []string) { return collectEC2(ctx, region, c.ec2) },
+		func() ([]CloudResource, []string) { return collectRDS(ctx, region, c.rds) },
+	} {
+		rs, es := collect()
+		out = append(out, rs...)
+		errs = append(errs, es...)
+	}
+	return out, errs
+}
 
-	elb := elasticloadbalancingv2.NewFromConfig(cfg)
-	if lbs, err := elb.DescribeLoadBalancers(ctx, &elasticloadbalancingv2.DescribeLoadBalancersInput{}); err == nil {
-		for _, lb := range lbs.LoadBalancers {
-			var ports []int
-			if ls, err := elb.DescribeListeners(ctx, &elasticloadbalancingv2.DescribeListenersInput{LoadBalancerArn: lb.LoadBalancerArn}); err == nil {
-				for _, l := range ls.Listeners {
-					if l.Port != nil {
-						ports = append(ports, int(*l.Port))
-					}
-				}
-			}
-			tags := map[string]string{}
-			if td, err := elb.DescribeTags(ctx, &elasticloadbalancingv2.DescribeTagsInput{ResourceArns: []string{aws.ToString(lb.LoadBalancerArn)}}); err == nil {
-				for _, d := range td.TagDescriptions {
-					for _, t := range d.Tags {
-						tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
-					}
-				}
-			}
-			out = append(out, normalizeLoadBalancer(lb, ports, tags, region))
+// collectLoadBalancers lists every load balancer, then its tags (batched) and listener ports.
+// A load balancer whose tags or listeners can't be read is left out rather than sent with empty
+// ports/tags: the server would overwrite the stored values with the empty ones, and could flag its
+// monitor orphaned. Left out, it keeps its last good data (an errored scan closes nothing).
+func collectLoadBalancers(ctx context.Context, region string, api elbAPI) ([]CloudResource, []string) {
+	var errs []string
+	var lbs []elbtypes.LoadBalancer
+	p := elasticloadbalancingv2.NewDescribeLoadBalancersPaginator(api, &elasticloadbalancingv2.DescribeLoadBalancersInput{})
+	for p.HasMorePages() {
+		pg, err := p.NextPage(ctx)
+		if err != nil {
+			errs = append(errs, awsErr("elasticloadbalancing:DescribeLoadBalancers", region, err))
+			break
 		}
-	} else {
-		log.Printf("aws: elb describe error in %s: %v", region, err)
-		errs = append(errs, awsErr("elasticloadbalancing:DescribeLoadBalancers", region, err))
+		lbs = append(lbs, pg.LoadBalancers...)
 	}
 
-	e := ec2.NewFromConfig(cfg)
-	if res, err := e.DescribeInstances(ctx, &ec2.DescribeInstancesInput{}); err == nil {
-		for _, r := range res.Reservations {
+	tags := map[string]map[string]string{}
+	for start := 0; start < len(lbs); start += elbTagsBatch {
+		arns := make([]string, 0, elbTagsBatch)
+		for _, lb := range lbs[start:min(start+elbTagsBatch, len(lbs))] {
+			arns = append(arns, aws.ToString(lb.LoadBalancerArn))
+		}
+		td, err := api.DescribeTags(ctx, &elasticloadbalancingv2.DescribeTagsInput{ResourceArns: arns})
+		if err != nil {
+			errs = append(errs, awsErr("elasticloadbalancing:DescribeTags", region, err))
+			continue
+		}
+		for _, arn := range arns {
+			tags[arn] = map[string]string{} // untagged LBs still get a (empty) map
+		}
+		for _, d := range td.TagDescriptions {
+			m := tags[aws.ToString(d.ResourceArn)]
+			if m == nil {
+				continue
+			}
+			for _, t := range d.Tags {
+				m[aws.ToString(t.Key)] = aws.ToString(t.Value)
+			}
+		}
+	}
+
+	var out []CloudResource
+	for _, lb := range lbs {
+		t, ok := tags[aws.ToString(lb.LoadBalancerArn)]
+		if !ok {
+			continue // its tag batch failed (already reported)
+		}
+		ports, err := listenerPorts(ctx, api, lb.LoadBalancerArn)
+		if err != nil {
+			errs = append(errs, awsErr("elasticloadbalancing:DescribeListeners", region, err))
+			continue
+		}
+		out = append(out, normalizeLoadBalancer(lb, ports, t, region))
+	}
+	return out, errs
+}
+
+// listenerPorts returns every listener port of one load balancer, across all pages.
+func listenerPorts(ctx context.Context, api elasticloadbalancingv2.DescribeListenersAPIClient, arn *string) ([]int, error) {
+	var ports []int
+	p := elasticloadbalancingv2.NewDescribeListenersPaginator(api, &elasticloadbalancingv2.DescribeListenersInput{LoadBalancerArn: arn})
+	for p.HasMorePages() {
+		pg, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range pg.Listeners {
+			if l.Port != nil {
+				ports = append(ports, int(*l.Port))
+			}
+		}
+	}
+	return ports, nil
+}
+
+// collectEC2 lists every instance across all pages. A failed page stops the listing and keeps
+// what earlier pages returned.
+func collectEC2(ctx context.Context, region string, api ec2.DescribeInstancesAPIClient) ([]CloudResource, []string) {
+	var out []CloudResource
+	p := ec2.NewDescribeInstancesPaginator(api, &ec2.DescribeInstancesInput{})
+	for p.HasMorePages() {
+		pg, err := p.NextPage(ctx)
+		if err != nil {
+			return out, []string{awsErr("ec2:DescribeInstances", region, err)}
+		}
+		for _, r := range pg.Reservations {
 			for _, inst := range r.Instances {
 				out = append(out, normalizeEC2Instance(inst, region))
 			}
 		}
-	} else {
-		log.Printf("aws: ec2 describe error in %s: %v", region, err)
-		errs = append(errs, awsErr("ec2:DescribeInstances", region, err))
 	}
+	return out, nil
+}
 
-	r := rds.NewFromConfig(cfg)
-	if dbs, err := r.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{}); err == nil {
-		for _, db := range dbs.DBInstances {
+// collectRDS lists every DB instance across all pages. Tags come back inline in TagList, so there
+// is no per-instance tag call.
+func collectRDS(ctx context.Context, region string, api rds.DescribeDBInstancesAPIClient) ([]CloudResource, []string) {
+	var out []CloudResource
+	p := rds.NewDescribeDBInstancesPaginator(api, &rds.DescribeDBInstancesInput{})
+	for p.HasMorePages() {
+		pg, err := p.NextPage(ctx)
+		if err != nil {
+			return out, []string{awsErr("rds:DescribeDBInstances", region, err)}
+		}
+		for _, db := range pg.DBInstances {
 			tags := map[string]string{}
-			if lt, err := r.ListTagsForResource(ctx, &rds.ListTagsForResourceInput{ResourceName: db.DBInstanceArn}); err == nil {
-				for _, t := range lt.TagList {
-					tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
-				}
+			for _, t := range db.TagList {
+				tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
 			}
 			out = append(out, normalizeRDS(db, tags, region))
 		}
-	} else {
-		log.Printf("aws: rds describe error in %s: %v", region, err)
-		errs = append(errs, awsErr("rds:DescribeDBInstances", region, err))
 	}
+	return out, nil
+}
 
-	return out, errs
+// awsRegionTimeout bounds ONE region's scan. Each region gets its own, so a slow or throttled
+// region can't use up the time of the regions after it.
+var awsRegionTimeout = 60 * time.Second
+
+// collectAllRegions scans regions in order, each under its own deadline.
+func collectAllRegions(regions []string, perRegion time.Duration, collect func(context.Context, string) ([]CloudResource, []string)) ([]CloudResource, []string) {
+	var all []CloudResource
+	var errs []string
+	for _, region := range regions {
+		ctx, cancel := context.WithTimeout(context.Background(), perRegion)
+		rs, es := collect(ctx, region)
+		cancel()
+		all = append(all, rs...)
+		errs = append(errs, es...)
+	}
+	return all, errs
 }
 
 // runAWSDiscovery collects all configured regions and pushes one snapshot. One pass.
 func runAWSDiscovery(client *Client, regions []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	var all []CloudResource
-	var errs []string
-	for _, region := range regions {
-		rs, es := collectAWS(ctx, region)
-		all = append(all, rs...)
-		errs = append(errs, es...)
+	all, errs := collectAllRegions(regions, awsRegionTimeout, collectAWS)
+	for _, e := range errs {
+		log.Printf("aws discovery: %s", e)
 	}
 	errMsg := representativeError(errs)
 	log.Printf("aws discovery: %d resources across %d region(s), %d error(s)", len(all), len(regions), len(errs))

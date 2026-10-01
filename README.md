@@ -49,8 +49,8 @@ All of the above is verifiable in this source — that is the point of publishin
 
 ## Check types
 
-`http` and `tcp` can also run from the CuliPulse edge (no agent); `icmp` and `udp` are
-agent-only. A `udp` check sends an optional payload and is "up" when a reply arrives within the
+Every probe type (`http`, `tcp`, `icmp`, `udp`) runs from an agent — CuliPulse's shared agents or
+your own. A `udp` check sends an optional payload and is "up" when a reply arrives within the
 timeout (matching the optional `expect` substring, in utf8 or hex); silence is always "down", so
 supply a protocol-correct payload for a meaningful check. The agent advertises its capabilities
 (`http,cert,tcp,icmp,udp`) at enrollment.
