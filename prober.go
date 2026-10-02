@@ -73,13 +73,8 @@ func buildClient(item WorkItem) *http.Client {
 	// No Client.Timeout: the per-request context (probeWith) governs the deadline, so this client is
 	// just a thin wrapper carrying the per-item redirect policy over the shared connection pool.
 	return &http.Client{
-		Transport: sharedTransport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !item.FollowRedirects || len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
+		Transport:     sharedTransport,
+		CheckRedirect: redirectPolicy(item),
 	}
 }
 
@@ -94,13 +89,8 @@ func buildFreshClient(item WorkItem) *http.Client {
 		DialContext:         guardedDialer(30 * time.Second).DialContext,
 	}
 	return &http.Client{
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !item.FollowRedirects || len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
+		Transport:     tr,
+		CheckRedirect: redirectPolicy(item),
 	}
 }
 
@@ -208,6 +198,9 @@ func classifyError(err error) string {
 	// sentinel), which string-matching the error text cannot distinguish from user-controlled text.
 	if errors.Is(err, errBlockedTarget) {
 		return "blocked_target"
+	}
+	if errors.Is(err, errInsecureRedirect) {
+		return "insecure_redirect"
 	}
 	s := err.Error()
 	switch {

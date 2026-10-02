@@ -20,6 +20,10 @@ type Request struct {
 	Auth        *Auth             `json:"auth,omitempty"`
 	Body        string            `json:"body,omitempty"`
 	ContentType string            `json:"contentType,omitempty"`
+	// Set by the worker for first-party agents only: which of Headers are secret, and whether Body
+	// is. Used to withhold them when a redirect leaves the original host or drops to http (#312).
+	SecretHeaderNames []string `json:"secretHeaderNames,omitempty"`
+	BodySecret        bool     `json:"bodySecret,omitempty"`
 }
 
 // Transport mirrors src/types.ts TransportSpec: connectionless probe params (udp today).

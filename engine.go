@@ -122,26 +122,51 @@ func splitDue(due []WorkItem, caps []string) (supported []WorkItem, abstains []I
 	return supported, abstains
 }
 
-// runEngine runs the probe pipeline until ctx is cancelled, then drains in-flight work and flushes
-// pending results. Pull, scheduling, probing, and ingest are decoupled goroutines connected by
-// channels, so a slow probe wave or a slow ingest never blocks the next pull, and probes are spread
-// across the dispatch ticks instead of firing in one synchronized burst per poll.
-// dispatchDiagnose probes each not-yet-seen diagnose one-shot exactly once (fresh connection via the
-// supplied probe) and returns the tagged results. `seen` is mutated to remember served request ids, so
-// a request still 'dispatched' on a later pull is not re-probed.
-func dispatchDiagnose(resp *PullResponse, seen map[string]bool, probe func(WorkItem) IngestResult) []IngestResult {
+const (
+	diagnoseWorkers   = 4
+	diagnoseQueueSize = 32
+)
+
+// enqueueDiagnose hands each not-yet-seen diagnose one-shot to the diagnose pool without blocking.
+// `seen` remembers served request ids so one still 'dispatched' on a later pull is not re-probed.
+// When the queue is full the item is dropped and logged: the server already marked it dispatched, so
+// it simply expires — the queue (32) far exceeds real diagnose volume, so this should be rare; a
+// server-side rate limit on diagnose requests is tracked separately.
+func enqueueDiagnose(resp *PullResponse, seen map[string]bool, queue chan<- WorkItem) (dropped int) {
 	if resp == nil {
-		return nil
+		return 0
 	}
-	out := make([]IngestResult, 0, len(resp.Diagnose))
 	for _, it := range resp.Diagnose {
 		if it.RequestID == "" || seen[it.RequestID] {
 			continue
 		}
 		seen[it.RequestID] = true
-		out = append(out, probe(it))
+		select {
+		case queue <- it:
+		default:
+			dropped++
+			log.Printf("diagnose queue full, dropping request=%s monitor=%s", it.RequestID, it.MonitorID)
+		}
 	}
-	return out
+	return dropped
+}
+
+// diagnoseWorker probes queued diagnose one-shots (fresh connection via probe) and POSTs each result
+// straight to ingest, bypassing the shared jobs/results channels so there is no channel-close race.
+func diagnoseWorker(ctx context.Context, queue <-chan WorkItem, probe func(WorkItem) IngestResult, ingest ingestFunc) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case it := <-queue:
+			res := probe(it)
+			ictx, cancel := context.WithTimeout(ctx, enginePullTimeout)
+			if err := ingest(ictx, []IngestResult{res}); err != nil {
+				log.Printf("diagnose ingest error: %v", err)
+			}
+			cancel()
+		}
+	}
 }
 
 // runRecovered runs fn under panic recovery: a panic is logged (name-tagged, with the panic value and
@@ -220,6 +245,15 @@ func safeLoop(name string, fn func()) {
 	go restartOnPanic(name, fn)
 }
 
+// runEngine runs the probe pipeline until ctx is cancelled. On shutdown it drains in-flight probe/ingest
+// work and flushes pending results, but diagnose one-shots still in flight are dropped rather than
+// waited on — the diagnose pool is tied directly to ctx and returns as soon as it is cancelled (see
+// diagnoseWorker). Pull, scheduling, probing, and ingest are decoupled goroutines connected by channels,
+// so a slow probe wave or a slow ingest never blocks the next pull, and probes are spread across the
+// dispatch ticks instead of firing in one synchronized burst per poll.
+// Diagnose one-shots run on their own small pool so a slow diagnose never delays the pulled work list
+// (#313): before, they ran serially inside pullLoop ahead of `updates <- pr`, so N slow targets held
+// back new/edited/paused monitors for every tenant on the agent by ~N × timeout.
 func runEngine(ctx context.Context, pull func(context.Context) (*PullResponse, error), ingest ingestFunc, probeFn probeFunc, cfg engineConfig) {
 	jobs := make(chan WorkItem, cfg.maxConcurrency)
 	results := make(chan IngestResult, cfg.maxConcurrency*2)
@@ -248,11 +282,15 @@ func runEngine(ctx context.Context, pull func(context.Context) (*PullResponse, e
 		restartOnPanic("ingest", func() { ingestLoop(ingest, results, cfg, stats) })
 	}()
 
-	// Pull: refresh the work list on its own cadence, never blocked by probing/ingest. Long-running
-	// for{} loop, so safeLoop restarts it on a recovered panic (see restartOnPanic).
-	// Diagnose items are probed inline in pullLoop (bypassing the shared jobs/results channels to avoid
-	// send-on-closed-channel races) using probeDiagnose for fresh-connection one-shot probes.
-	safeLoop("pull", func() { pullLoop(ctx, pull, ingest, probeDiagnose, cfg, updates, stats) })
+	// Diagnose pool: a few workers fed by a bounded queue, started once here (not inside pullLoop) so a
+	// pullLoop restart never spawns a second pool. Each worker is a long-running loop restarted on panic.
+	diagQueue := make(chan WorkItem, diagnoseQueueSize)
+	for i := 0; i < diagnoseWorkers; i++ {
+		safeLoop("diagnose", func() { diagnoseWorker(ctx, diagQueue, probeDiagnose, ingest) })
+	}
+
+	// Pull: refresh the work list on its own cadence, never blocked by probing/ingest/diagnose.
+	safeLoop("pull", func() { pullLoop(ctx, pull, diagQueue, cfg, updates, stats) })
 
 	// Optional periodic activity summary (operator visibility). Long-running for{} loop; restart on
 	// panic like the other main loops.
@@ -273,7 +311,7 @@ func runEngine(ctx context.Context, pull func(context.Context) (*PullResponse, e
 	ingester.Wait() // ingester performs its final flush and exits
 }
 
-func pullLoop(ctx context.Context, pull func(context.Context) (*PullResponse, error), ingest ingestFunc, diagProbe func(WorkItem) IngestResult, cfg engineConfig, updates chan<- *PullResponse, stats *engineStats) {
+func pullLoop(ctx context.Context, pull func(context.Context) (*PullResponse, error), diagQueue chan<- WorkItem, cfg engineConfig, updates chan<- *PullResponse, stats *engineStats) {
 	seen := map[string]bool{} // persists across pulls; deduplicates diagnose request ids
 	doPull := func() {
 		cctx, cancel := context.WithTimeout(ctx, enginePullTimeout)
@@ -285,13 +323,7 @@ func pullLoop(ctx context.Context, pull func(context.Context) (*PullResponse, er
 		}
 		stats.pulls.Add(1)
 		stats.work.Store(int64(len(pr.Work)))
-		// Probe diagnose items inline (fresh connection, one-shot, deduped) and POST directly via
-		// ingest — bypasses the shared jobs/results channels entirely so there is no channel-close race.
-		if diag := dispatchDiagnose(pr, seen, diagProbe); len(diag) > 0 {
-			if err := ingest(cctx, diag); err != nil {
-				log.Printf("diagnose ingest error: %v", err)
-			}
-		}
+		enqueueDiagnose(pr, seen, diagQueue) // never blocks: the work list below goes out right away
 		select {
 		case updates <- pr:
 		case <-ctx.Done():

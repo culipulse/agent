@@ -173,49 +173,135 @@ func TestRunEngineProbesIngestsAbstainsAndShutsDown(t *testing.T) {
 	}
 }
 
-func TestDispatchDiagnose(t *testing.T) {
-	stubProbe := func(it WorkItem) IngestResult {
+func TestEnqueueDiagnose(t *testing.T) {
+	t.Run("queues a new item and marks it seen", func(t *testing.T) {
+		seen := map[string]bool{}
+		q := make(chan WorkItem, 4)
+		resp := &PullResponse{Diagnose: []WorkItem{{MonitorID: "m1", RequestID: "req-1"}}}
+		if d := enqueueDiagnose(resp, seen, q); d != 0 {
+			t.Fatalf("dropped %d", d)
+		}
+		if len(q) != 1 || !seen["req-1"] {
+			t.Fatalf("want 1 queued + seen, got len=%d seen=%v", len(q), seen)
+		}
+	})
+	t.Run("skips seen and empty request ids", func(t *testing.T) {
+		seen := map[string]bool{"req-1": true}
+		q := make(chan WorkItem, 4)
+		resp := &PullResponse{Diagnose: []WorkItem{{MonitorID: "m1", RequestID: "req-1"}, {MonitorID: "m2"}}}
+		enqueueDiagnose(resp, seen, q)
+		if len(q) != 0 {
+			t.Fatalf("want nothing queued, got %d", len(q))
+		}
+	})
+	t.Run("nil response is a no-op", func(t *testing.T) {
+		if d := enqueueDiagnose(nil, map[string]bool{}, make(chan WorkItem, 1)); d != 0 {
+			t.Fatal("nil resp must not drop")
+		}
+	})
+	t.Run("full queue drops instead of blocking", func(t *testing.T) {
+		q := make(chan WorkItem, 1)
+		resp := &PullResponse{Diagnose: []WorkItem{{RequestID: "a"}, {RequestID: "b"}, {RequestID: "c"}}}
+		done := make(chan int, 1)
+		go func() { done <- enqueueDiagnose(resp, map[string]bool{}, q) }()
+		select {
+		case d := <-done:
+			if d != 2 || len(q) != 1 {
+				t.Fatalf("want 1 queued + 2 dropped, got queued=%d dropped=%d", len(q), d)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("enqueueDiagnose blocked on a full queue")
+		}
+	})
+}
+
+// The regression #313 is about: a slow diagnose must not delay delivery of the pulled work list.
+func TestPullLoop_SlowDiagnoseDoesNotDelayUpdates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pull := func(context.Context) (*PullResponse, error) {
+		return &PullResponse{Work: []WorkItem{{MonitorID: "w"}}, Diagnose: []WorkItem{{MonitorID: "m", RequestID: "r1"}}}, nil
+	}
+	q := make(chan WorkItem, diagnoseQueueSize)
+	release := make(chan struct{})
+	defer close(release)
+	go diagnoseWorker(ctx, q, func(it WorkItem) IngestResult { <-release; return IngestResult{MonitorID: it.MonitorID} },
+		func(context.Context, []IngestResult) error { return nil })
+	updates := make(chan *PullResponse, 1)
+	go pullLoop(ctx, pull, q, engineConfig{pollInterval: time.Hour}, updates, &engineStats{})
+	select {
+	case pr := <-updates:
+		if len(pr.Work) != 1 {
+			t.Fatalf("unexpected update %+v", pr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("work list was held back by an in-flight diagnose probe")
+	}
+}
+
+// Diagnoses run concurrently across the pool and each result is ingested with its request id.
+func TestDiagnoseWorkers_RunConcurrentlyAndIngest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	q := make(chan WorkItem, diagnoseQueueSize)
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var ingested []string
+	ingestDone := make(chan struct{}, 2)
+	probe := func(it WorkItem) IngestResult {
+		started <- it.RequestID
+		<-release
 		return IngestResult{MonitorID: it.MonitorID, RequestID: it.RequestID}
 	}
+	ingest := func(_ context.Context, rs []IngestResult) error {
+		mu.Lock()
+		for _, r := range rs {
+			ingested = append(ingested, r.RequestID)
+		}
+		mu.Unlock()
+		ingestDone <- struct{}{}
+		return nil
+	}
+	for i := 0; i < 2; i++ {
+		go diagnoseWorker(ctx, q, probe, ingest)
+	}
+	q <- WorkItem{MonitorID: "m1", RequestID: "a"}
+	q <- WorkItem{MonitorID: "m2", RequestID: "b"}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("two diagnoses did not run at the same time")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-ingestDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("result not ingested")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ingested) != 2 {
+		t.Fatalf("want 2 ingested, got %v", ingested)
+	}
+}
 
-	t.Run("probes a new item and marks it seen", func(t *testing.T) {
-		seen := map[string]bool{}
-		resp := &PullResponse{Diagnose: []WorkItem{{MonitorID: "m1", RequestID: "req-1"}}}
-		got := dispatchDiagnose(resp, seen, stubProbe)
-		if len(got) != 1 {
-			t.Fatalf("expected 1 result, got %d", len(got))
-		}
-		if got[0].RequestID != "req-1" {
-			t.Errorf("expected RequestID=req-1, got %q", got[0].RequestID)
-		}
-		if !seen["req-1"] {
-			t.Error("req-1 must be marked seen after first dispatch")
-		}
-	})
-
-	t.Run("deduplicates on second call with same seen map", func(t *testing.T) {
-		seen := map[string]bool{"req-1": true}
-		resp := &PullResponse{Diagnose: []WorkItem{{MonitorID: "m1", RequestID: "req-1"}}}
-		got := dispatchDiagnose(resp, seen, stubProbe)
-		if len(got) != 0 {
-			t.Fatalf("expected 0 results (already seen), got %d", len(got))
-		}
-	})
-
-	t.Run("skips items with empty RequestID", func(t *testing.T) {
-		seen := map[string]bool{}
-		resp := &PullResponse{Diagnose: []WorkItem{{MonitorID: "m1", RequestID: ""}}}
-		got := dispatchDiagnose(resp, seen, stubProbe)
-		if len(got) != 0 {
-			t.Fatalf("expected 0 results (empty RequestID), got %d", len(got))
-		}
-	})
-
-	t.Run("nil response returns nil", func(t *testing.T) {
-		seen := map[string]bool{}
-		got := dispatchDiagnose(nil, seen, stubProbe)
-		if got != nil {
-			t.Fatalf("expected nil for nil resp, got %v", got)
-		}
-	})
+func TestDiagnoseWorker_StopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		diagnoseWorker(ctx, make(chan WorkItem), func(WorkItem) IngestResult { return IngestResult{} },
+			func(context.Context, []IngestResult) error { return nil })
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit on cancel")
+	}
 }
