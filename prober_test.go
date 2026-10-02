@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 )
@@ -257,5 +260,88 @@ func TestProbeDiagnose_FreshConnEachTime(t *testing.T) {
 		if _, ok := tm["connectMs"]; !ok {
 			t.Errorf("probe %d fresh conn should measure connectMs", i)
 		}
+	}
+}
+
+// #334: a domain that doesn't resolve must surface as a DNS cause, not "conn_error".
+// Classification is by error IDENTITY (*net.DNSError), never by error text.
+func TestClassifyDNSError(t *testing.T) {
+	nx := &net.DNSError{Err: "no such host", Name: "nxdomain-test.invalid", IsNotFound: true}
+	to := &net.DNSError{Err: "i/o timeout", Name: "slow.example", IsTimeout: true}
+	servfail := &net.DNSError{Err: "server misbehaving", Name: "x.example", IsTemporary: true}
+	wrap := func(e error) error { return &net.OpError{Op: "dial", Net: "tcp", Err: e} }
+	cases := []struct {
+		name   string
+		err    error
+		want   string
+		wantOK bool
+	}{
+		{"nxdomain", wrap(nx), "dns_nxdomain", true},
+		{"timeout", wrap(to), "dns_error", true},
+		{"servfail", wrap(servfail), "dns_error", true},
+		{"refused is not dns", wrap(errors.New("connect: connection refused")), "", false},
+		{"text alone is not dns", errors.New("lookup x: no such host"), "", false},
+	}
+	for _, c := range cases {
+		got, ok := classifyDNSError(c.err)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("%s: classifyDNSError = (%q,%v), want (%q,%v)", c.name, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestClassifyDNSError_HTTPWrapped(t *testing.T) {
+	// net/http wraps dial failures in *url.Error; its text contains "timeout" for a DNS timeout,
+	// which the old switch mapped to "timeout". The DNS check must win.
+	mk := func(d *net.DNSError) error {
+		return &url.Error{Op: "Get", URL: "https://x.example/", Err: &net.OpError{Op: "dial", Net: "tcp", Err: d}}
+	}
+	if got := classifyError(mk(&net.DNSError{Err: "no such host", Name: "x.example", IsNotFound: true})); got != "dns_nxdomain" {
+		t.Errorf("http nxdomain: got %q, want dns_nxdomain", got)
+	}
+	if got := classifyError(mk(&net.DNSError{Err: "i/o timeout", Name: "x.example", IsTimeout: true})); got != "dns_error" {
+		t.Errorf("http dns timeout: got %q, want dns_error", got)
+	}
+	if got := classifyTCPError(&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "i/o timeout", IsTimeout: true}}); got != "dns_error" {
+		t.Errorf("tcp dns timeout: got %q, want dns_error (was tcp_timeout)", got)
+	}
+	if got := classifyTCPError(&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}); got != "dns_nxdomain" {
+		t.Errorf("tcp nxdomain: got %q, want dns_nxdomain", got)
+	}
+	if got := classifyUDPError(&net.OpError{Op: "dial", Net: "udp", Err: &net.DNSError{Err: "i/o timeout", IsTimeout: true}}); got != "dns_error" {
+		t.Errorf("udp dns timeout: got %q, want dns_error (was udp_no_reply)", got)
+	}
+	if got := classifyUDPError(&net.OpError{Op: "dial", Net: "udp", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}); got != "dns_nxdomain" {
+		t.Errorf("udp nxdomain: got %q, want dns_nxdomain", got)
+	}
+}
+
+// Untyped errors that merely carry lookup text keep the TCP/UDP string fallback (unchanged behaviour).
+func TestClassifyDNSError_TCPUDPStringFallbackKept(t *testing.T) {
+	e := errors.New("lookup x.example: no such host")
+	if got := classifyTCPError(e); got != "dns_error" {
+		t.Errorf("tcp fallback: got %q, want dns_error", got)
+	}
+	if got := classifyUDPError(e); got != "dns_error" {
+		t.Errorf("udp fallback: got %q, want dns_error", got)
+	}
+}
+
+// The HTTP classifier must not gain a DNS string match: a refused connection to a URL whose path
+// contains DNS-ish text stays conn_error (spoof rule, cf. TestClassifyError_NoSpoofFromTargetURLText).
+func TestClassifyError_NoDNSSpoofFromTargetURLText(t *testing.T) {
+	res := probe(WorkItem{MonitorID: "m", Type: "http", Target: "http://127.0.0.1:1/no%20such%20host-lookup", TimeoutMs: 1000, Method: "GET", ExpectedStatus: "2xx"})
+	if res.Cause == nil || *res.Cause != "conn_error" {
+		t.Fatalf("want conn_error, got cause=%v", res.Cause)
+	}
+}
+
+// End-to-end through the real resolver and http.Client wrap chain. ".invalid" never resolves
+// (RFC 6761); depending on sandbox DNS the lookup is NXDOMAIN or a resolver error — either way a
+// DNS cause, never conn_error.
+func TestProbe_UnresolvableHostIsDNSCause(t *testing.T) {
+	res := probe(WorkItem{MonitorID: "m", Type: "http", Target: "http://nxdomain-test.invalid/", TimeoutMs: 3000, Method: "GET", ExpectedStatus: "2xx"})
+	if res.Cause == nil || (*res.Cause != "dns_nxdomain" && *res.Cause != "dns_error") {
+		t.Fatalf("want dns_nxdomain or dns_error, got ok=%v cause=%v", res.OK, res.Cause)
 	}
 }

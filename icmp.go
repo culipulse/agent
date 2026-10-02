@@ -54,7 +54,7 @@ func icmpProbe(item WorkItem) IngestResult {
 	}
 	ipaddr, err := net.ResolveIPAddr("ip4", item.Target)
 	if err != nil {
-		c := "dns_error"
+		c := icmpResolveCause(err)
 		res.Cause = &c
 		return res
 	}
@@ -140,4 +140,13 @@ func pingOnce(conn *icmp.PacketConn, ipaddr *net.IPAddr, id int, per time.Durati
 		}
 		// not ours — keep reading until our reply or the deadline
 	}
+}
+
+// icmpResolveCause maps a resolver failure to a cause: dns_nxdomain for a missing domain (same
+// classifier as http/tcp/udp), dns_error for anything else.
+func icmpResolveCause(err error) string {
+	if c, ok := classifyDNSError(err); ok {
+		return c
+	}
+	return "dns_error"
 }

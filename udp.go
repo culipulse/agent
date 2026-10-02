@@ -76,6 +76,9 @@ func classifyUDPError(err error) string {
 	if errors.Is(err, errBlockedTarget) {
 		return "blocked_target"
 	}
+	if c, ok := classifyDNSError(err); ok {
+		return c
+	}
 	s := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(s, "timeout") || strings.Contains(s, "deadline") || strings.Contains(s, "i/o timeout"):

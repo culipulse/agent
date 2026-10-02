@@ -90,6 +90,9 @@ func classifyTCPError(err error) string {
 	if errors.Is(err, errBlockedTarget) {
 		return "blocked_target"
 	}
+	if c, ok := classifyDNSError(err); ok {
+		return c
+	}
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "refused"):

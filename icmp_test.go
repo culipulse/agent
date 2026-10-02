@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"testing"
 
@@ -67,5 +68,31 @@ func TestMatchesEchoReply(t *testing.T) {
 	}
 	if matchesEchoReply(nil, 42, 1) {
 		t.Fatal("nil must not match")
+	}
+}
+
+// A missing domain must be reported as dns_nxdomain (same classifier as http/tcp/udp), any other
+// resolver failure as dns_error.
+func TestICMPResolveCause(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nxdomain", &net.DNSError{Err: "no such host", IsNotFound: true}, "dns_nxdomain"},
+		{"timeout", &net.DNSError{Err: "i/o timeout", IsTimeout: true}, "dns_error"},
+		{"non-dns error", errors.New("weird"), "dns_error"},
+	}
+	for _, c := range cases {
+		if got := icmpResolveCause(c.err); got != c.want {
+			t.Errorf("%s: icmpResolveCause = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestICMPProbeUnresolvableDomainCause(t *testing.T) {
+	res := icmpProbe(WorkItem{MonitorID: "m", Type: "icmp", Target: "nxdomain-test.invalid", TimeoutMs: 3000})
+	if res.Cause == nil || (*res.Cause != "dns_nxdomain" && *res.Cause != "dns_error") {
+		t.Fatalf("cause = %v, want dns_nxdomain or dns_error", res.Cause)
 	}
 }

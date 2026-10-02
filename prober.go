@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strings"
@@ -202,6 +203,9 @@ func classifyError(err error) string {
 	if errors.Is(err, errInsecureRedirect) {
 		return "insecure_redirect"
 	}
+	if c, ok := classifyDNSError(err); ok {
+		return c
+	}
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "certificate has expired") || strings.Contains(s, "certificate is not yet valid"):
@@ -213,6 +217,21 @@ func classifyError(err error) string {
 	default:
 		return "conn_error"
 	}
+}
+
+// classifyDNSError maps a name-resolution failure to a DNS cause by error IDENTITY (errors.As walks
+// url.Error -> net.OpError -> *net.DNSError), never by text a target could contain. NXDOMAIN ("the
+// domain doesn't exist") is told apart from every other lookup failure, incl. a resolver timeout.
+// Called by all probe classifiers after the guard sentinels and before any timeout/string branch.
+func classifyDNSError(err error) (string, bool) {
+	var de *net.DNSError
+	if !errors.As(err, &de) {
+		return "", false
+	}
+	if de.IsNotFound {
+		return "dns_nxdomain", true
+	}
+	return "dns_error", true
 }
 
 // probeDiagnose runs a one-shot diagnostic probe on a fresh connection and tags the result with the
