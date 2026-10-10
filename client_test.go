@@ -202,3 +202,39 @@ func TestDoCapsResponseBody(t *testing.T) {
 		t.Fatalf("expected 4 MiB string to round-trip uncapped, got len %d", len(s))
 	}
 }
+
+func TestCloudResourcesSendsScannedPairsOnlyWhenGiven(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"upserted":0,"closed":0}`)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok")
+
+	// An agent that reports per-pair results sends the list, even an empty one.
+	if err := c.CloudResources(context.Background(), "aws", nil, "ec2:DescribeInstances (r1): AccessDenied", []ScannedPair{}); err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]json.RawMessage
+	_ = json.Unmarshal(gotBody, &body)
+	if string(body["scanned"]) != "[]" {
+		t.Fatalf("an empty scanned list must still be sent, got %s", gotBody)
+	}
+
+	if err := c.CloudResources(context.Background(), "aws", nil, "", []ScannedPair{{ResourceType: "ec2", Region: "r1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(gotBody, []byte(`"scanned":[{"resourceType":"ec2","region":"r1"}]`)) {
+		t.Fatalf("scanned pair not sent: %s", gotBody)
+	}
+
+	// nil (no per-pair data) leaves the field out entirely.
+	if err := c.CloudResources(context.Background(), "aws", nil, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(gotBody, []byte(`"scanned"`)) {
+		t.Fatalf("nil scanned must be omitted: %s", gotBody)
+	}
+}

@@ -57,8 +57,10 @@ supply a protocol-correct payload for a meaningful check. The agent advertises i
 
 ## Image
 
-`ghcr.io/culipulse/agent:latest` (also tagged per commit `sha-<short>` and, on `v*`
-releases, by semver).
+`ghcr.io/culipulse/agent:latest` is always the newest **released** version (published only
+from `v*` release tags, which also carry a semver tag such as `1.12.1` if you want to pin one).
+Builds of unreleased `master` are tagged `:edge` and per commit `sha-<short>`; they are for
+testing, not production.
 
 The image is **multi-arch** (`linux/amd64` + `linux/arm64`) — `docker run …:latest` auto-selects
 your host's architecture, so it runs natively on Apple Silicon and ARM cloud VMs
@@ -70,12 +72,14 @@ dashboard shows it per agent.
 Get the exact command (with your token) from the dashboard: **Agents → enroll**, or any agent's
 detail page → **Connect this agent**. It looks like:
 
-    docker run -d --restart=unless-stopped --cap-add=NET_RAW \
+    docker run -d --restart=unless-stopped --network host --cap-add=NET_RAW \
       -e CULIPULSE_API_URL=https://culipulse.dev \
       -e CULIPULSE_AGENT_TOKEN=cpa_... \
       ghcr.io/culipulse/agent:latest
 
-`--cap-add=NET_RAW` is needed only for ICMP checks; drop it otherwise.
+`--network host` lets the agent reach services on the same machine (e.g. `127.0.0.1:6379`); without it,
+`127.0.0.1` inside the container is the container itself. On Docker Desktop (Mac, Windows or Linux),
+host networking is the Docker VM by default, so use `host.docker.internal` as the target instead. `--cap-add=NET_RAW` is needed only for ICMP checks; drop it otherwise.
 
 ### Environment variables
 
@@ -92,7 +96,7 @@ detail page → **Connect this agent**. It looks like:
 ## Updating
 
 **Recommended — auto-update sidecar (set once):** run Watchtower scoped to just the agent
-container; it pulls and recreates it in place when a new image ships, preserving your env/token:
+container; it pulls and recreates it in place when a new release ships, preserving your env/token:
 
     docker run -d --name culipulse-watchtower --restart=unless-stopped \
       -v /var/run/docker.sock:/var/run/docker.sock \

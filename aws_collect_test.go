@@ -61,7 +61,11 @@ type fakeELB struct {
 	blockListeners bool                         // DescribeListeners waits for ctx to end
 	tags           map[string]map[string]string // by LB ARN
 	tagErrOnCall   int                          // 1-based DescribeTags call that fails; 0 = none
+	tagFailArns    map[string]bool              // any DescribeTags call that includes one of these ARNs fails
 	tagCalls       [][]string
+	listenerCalls  int
+	sameMarker     bool // DescribeLoadBalancers/DescribeListeners always return the same next token
+	emptyEnd       bool // the last page carries an EMPTY next token (the SDK treats that as the end)
 }
 
 func (f *fakeELB) DescribeLoadBalancers(ctx context.Context, in *elbv2.DescribeLoadBalancersInput, _ ...func(*elbv2.Options)) (*elbv2.DescribeLoadBalancersOutput, error) {
@@ -69,10 +73,23 @@ func (f *fakeELB) DescribeLoadBalancers(ctx context.Context, in *elbv2.DescribeL
 	if f.failPage[i] {
 		return nil, errors.New("Throttling: Rate exceeded")
 	}
+	if f.sameMarker {
+		next = aws.String("same")
+	}
+	if f.emptyEnd && next == nil {
+		next = aws.String("")
+	}
 	return &elbv2.DescribeLoadBalancersOutput{LoadBalancers: items, NextMarker: next}, nil
 }
 
 func (f *fakeELB) DescribeListeners(ctx context.Context, in *elbv2.DescribeListenersInput, _ ...func(*elbv2.Options)) (*elbv2.DescribeListenersOutput, error) {
+	f.listenerCalls++
+	if f.sameMarker {
+		return &elbv2.DescribeListenersOutput{NextMarker: aws.String("same")}, nil
+	}
+	if f.emptyEnd {
+		return &elbv2.DescribeListenersOutput{Listeners: []elbtypes.Listener{{Port: aws.Int32(443)}}, NextMarker: aws.String("")}, nil
+	}
 	if f.blockListeners {
 		<-ctx.Done()
 		return nil, fmt.Errorf("operation error Elastic Load Balancing v2: DescribeListeners, https response error: %w", ctx.Err())
@@ -96,6 +113,11 @@ func (f *fakeELB) DescribeTags(ctx context.Context, in *elbv2.DescribeTagsInput,
 	if f.tagErrOnCall == len(f.tagCalls) {
 		return nil, errors.New("AccessDenied")
 	}
+	for _, a := range in.ResourceArns {
+		if f.tagFailArns[a] {
+			return nil, errors.New("AccessDenied")
+		}
+	}
 	out := &elbv2.DescribeTagsOutput{}
 	for _, a := range in.ResourceArns {
 		var ts []elbtypes.Tag
@@ -108,27 +130,47 @@ func (f *fakeELB) DescribeTags(ctx context.Context, in *elbv2.DescribeTagsInput,
 }
 
 type fakeEC2 struct {
-	pages    [][]ec2types.Instance
-	failPage map[int]bool
+	pages     [][]ec2types.Instance
+	failPage  map[int]bool
+	sameToken bool // always return the same next token
+	emptyEnd  bool // the last page carries an empty next token
+	calls     int
 }
 
 func (f *fakeEC2) DescribeInstances(ctx context.Context, in *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	f.calls++
 	items, next, i := page(f.pages, in.NextToken)
 	if f.failPage[i] {
 		return nil, errors.New("RequestLimitExceeded")
+	}
+	if f.sameToken {
+		next = aws.String("same")
+	}
+	if f.emptyEnd && next == nil {
+		next = aws.String("")
 	}
 	return &ec2.DescribeInstancesOutput{Reservations: []ec2types.Reservation{{Instances: items}}, NextToken: next}, nil
 }
 
 type fakeRDS struct {
-	pages    [][]rdstypes.DBInstance
-	failPage map[int]bool
+	pages     [][]rdstypes.DBInstance
+	failPage  map[int]bool
+	sameToken bool // always return the same next token
+	emptyEnd  bool // the last page carries an empty next token
+	calls     int
 }
 
 func (f *fakeRDS) DescribeDBInstances(ctx context.Context, in *rds.DescribeDBInstancesInput, _ ...func(*rds.Options)) (*rds.DescribeDBInstancesOutput, error) {
+	f.calls++
 	items, next, i := page(f.pages, in.Marker)
 	if f.failPage[i] {
 		return nil, errors.New("Throttling")
+	}
+	if f.sameToken {
+		next = aws.String("same")
+	}
+	if f.emptyEnd && next == nil {
+		next = aws.String("")
 	}
 	return &rds.DescribeDBInstancesOutput{DBInstances: items, Marker: next}, nil
 }
@@ -208,15 +250,12 @@ func TestCollectLoadBalancersListenerFailureOmitsResourceAndReportsIt(t *testing
 	}
 }
 
-func TestCollectLoadBalancersTagFailureOmitsThatBatchAndReportsIt(t *testing.T) {
+func TestCollectLoadBalancersRecoversFromATransientTagBatchFailure(t *testing.T) {
 	f := elbFixture(25, 100) // one page of 25 → tag batches of 20 + 5
-	f.tagErrOnCall = 1
+	f.tagErrOnCall = 1       // only the first batch call fails; the per-ARN retries succeed
 	out, errs := collectLoadBalancers(context.Background(), "r1", f)
-	if len(out) != 5 {
-		t.Fatalf("want the failed batch of 20 omitted (5 left), got %d", len(out))
-	}
-	if !hasErr(errs, "elasticloadbalancing:DescribeTags (r1)") {
-		t.Fatalf("tag failure not reported: %v", errs)
+	if len(out) != 25 || len(errs) != 0 {
+		t.Fatalf("a failed batch is retried per ARN: want all 25 and no errors, got %d / %v", len(out), errs)
 	}
 }
 
@@ -308,7 +347,7 @@ func TestCollectEC2PageFailureKeepsEarlierPagesAndReportsIt(t *testing.T) {
 
 func TestCollectRegionCombinesAllServices(t *testing.T) {
 	c := awsClients{elb: elbFixture(2, 20), ec2: &fakeEC2{pages: ec2Pages(3, 5)}, rds: &fakeRDS{pages: rdsPages(4, 100)}}
-	out, errs := collectRegion(context.Background(), "r1", c)
+	out, errs, _ := collectRegion(context.Background(), "r1", c)
 	if len(errs) != 0 || len(out) != 9 {
 		t.Fatalf("want 2+3+4 = 9 resources and no errs, got %d / %v", len(out), errs)
 	}
@@ -327,7 +366,7 @@ func TestCollectRegionReportsADeadlineMidScan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, errs := collectRegion(ctx, "r1", awsClients{elb: f, ec2: &fakeEC2{}, rds: &fakeRDS{}})
+	_, errs, _ := collectRegion(ctx, "r1", awsClients{elb: f, ec2: &fakeEC2{}, rds: &fakeRDS{}})
 	if time.Since(start) > 2*time.Second {
 		t.Fatalf("collectRegion did not stop at the deadline")
 	}
@@ -338,19 +377,159 @@ func TestCollectRegionReportsADeadlineMidScan(t *testing.T) {
 
 func TestCollectAllRegionsGivesEachRegionItsOwnDeadline(t *testing.T) {
 	var fastLive bool
-	collect := func(ctx context.Context, region string) ([]CloudResource, []string) {
+	collect := func(ctx context.Context, region string) ([]CloudResource, []string, []ScannedPair) {
 		if region == "slow" {
 			<-ctx.Done() // uses up its whole budget
-			return nil, []string{awsErr("ec2:DescribeInstances", region, ctx.Err())}
+			return nil, []string{awsErr("ec2:DescribeInstances", region, ctx.Err())}, nil
 		}
 		fastLive = ctx.Err() == nil
-		return []CloudResource{{ResourceID: "fast-1"}}, nil
+		return []CloudResource{{ResourceID: "fast-1"}}, nil, []ScannedPair{{ResourceType: "ec2", Region: region}}
 	}
-	out, errs := collectAllRegions([]string{"slow", "fast"}, 50*time.Millisecond, collect)
+	out, errs, scanned := collectAllRegions([]string{"slow", "fast"}, 50*time.Millisecond, collect)
 	if !fastLive {
 		t.Fatalf("the region after a slow one started with an expired deadline")
 	}
 	if len(out) != 1 || !hasErr(errs, "ec2:DescribeInstances (slow): timed out") {
 		t.Fatalf("got out=%v errs=%v", out, errs)
+	}
+	if len(scanned) != 1 || scanned[0].Region != "fast" {
+		t.Fatalf("only the region that finished is a scanned pair, got %v", scanned)
+	}
+}
+
+func hasPair(pairs []ScannedPair, rt, region string) bool {
+	for _, p := range pairs {
+		if p.ResourceType == rt && p.Region == region {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCollectRegionReportsEveryCleanPairAsScanned(t *testing.T) {
+	c := awsClients{elb: elbFixture(2, 20), ec2: &fakeEC2{pages: ec2Pages(3, 5)}, rds: &fakeRDS{pages: rdsPages(4, 100)}}
+	_, errs, scanned := collectRegion(context.Background(), "r1", c)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errs: %v", errs)
+	}
+	for _, rt := range []string{"alb", "nlb", "ec2", "rds"} {
+		if !hasPair(scanned, rt, "r1") {
+			t.Fatalf("clean %s scan must be reported as scanned, got %v", rt, scanned)
+		}
+	}
+}
+
+func TestCollectRegionLeavesAFailedServiceOutOfScanned(t *testing.T) {
+	// RDS is denied (a persistent partial error); load balancers and EC2 are fine.
+	c := awsClients{elb: elbFixture(2, 20), ec2: &fakeEC2{pages: ec2Pages(3, 5)}, rds: &fakeRDS{pages: rdsPages(4, 100), failPage: map[int]bool{0: true}}}
+	_, errs, scanned := collectRegion(context.Background(), "r1", c)
+	if !hasErr(errs, "rds:DescribeDBInstances (r1)") {
+		t.Fatalf("rds failure not reported: %v", errs)
+	}
+	if hasPair(scanned, "rds", "r1") {
+		t.Fatalf("a failed rds scan must not be reported as scanned: %v", scanned)
+	}
+	for _, rt := range []string{"alb", "nlb", "ec2"} {
+		if !hasPair(scanned, rt, "r1") {
+			t.Fatalf("%s scanned cleanly and must still be reported: %v", rt, scanned)
+		}
+	}
+}
+
+func TestCollectRegionLoadBalancerFailureLeavesAlbAndNlbOutOfScanned(t *testing.T) {
+	f := elbFixture(3, 20)
+	f.listenerErr = map[string]error{"arn:lb:1": errors.New("Throttling")}
+	_, _, scanned := collectRegion(context.Background(), "r1", awsClients{elb: f, ec2: &fakeEC2{}, rds: &fakeRDS{}})
+	if hasPair(scanned, "alb", "r1") || hasPair(scanned, "nlb", "r1") {
+		t.Fatalf("an LB that was left out means the LB scan is not complete: %v", scanned)
+	}
+	if !hasPair(scanned, "ec2", "r1") || !hasPair(scanned, "rds", "r1") {
+		t.Fatalf("ec2/rds were clean: %v", scanned)
+	}
+}
+
+func TestCollectLoadBalancersStopsAtTheDeadlineInsteadOfFloodingErrors(t *testing.T) {
+	f := elbFixture(30, 100)
+	f.blockListeners = true
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, errs := collectLoadBalancers(ctx, "r1", f)
+	if f.listenerCalls != 1 {
+		t.Fatalf("after the deadline no further listener calls should be made, got %d", f.listenerCalls)
+	}
+	if len(errs) != 1 || !hasErr(errs, "DescribeListeners (r1): timed out") {
+		t.Fatalf("want exactly one timed-out error, got %v", errs)
+	}
+}
+
+func TestPaginatorsStopOnARepeatedTokenAndReportIt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	e := &fakeEC2{pages: ec2Pages(10, 5), sameToken: true}
+	_, errs := collectEC2(ctx, "r1", e)
+	if e.calls > 3 || !hasErr(errs, "ec2:DescribeInstances (r1): repeated page token") {
+		t.Fatalf("ec2: %d calls, errs %v", e.calls, errs)
+	}
+
+	r := &fakeRDS{pages: rdsPages(250, 100), sameToken: true}
+	_, errs = collectRDS(ctx, "r1", r)
+	if r.calls > 3 || !hasErr(errs, "rds:DescribeDBInstances (r1): repeated page token") {
+		t.Fatalf("rds: %d calls, errs %v", r.calls, errs)
+	}
+
+	f := elbFixture(30, 20)
+	f.sameMarker = true
+	_, errs = collectLoadBalancers(ctx, "r1", f)
+	if !hasErr(errs, "elasticloadbalancing:DescribeLoadBalancers (r1): repeated page token") {
+		t.Fatalf("lb: errs %v", errs)
+	}
+	if f.listenerCalls > 100 {
+		t.Fatalf("listener paginator kept spinning: %d calls", f.listenerCalls)
+	}
+	if !hasErr(errs, "elasticloadbalancing:DescribeListeners (r1): repeated page token") {
+		t.Fatalf("listeners: errs %v", errs)
+	}
+}
+
+func TestCollectLoadBalancersRetriesEachARNWhenATagBatchFails(t *testing.T) {
+	f := elbFixture(25, 100) // tag batches of 20 + 5
+	f.tagFailArns = map[string]bool{"arn:lb:3": true}
+	out, errs := collectLoadBalancers(context.Background(), "r1", f)
+	if len(out) != 24 {
+		t.Fatalf("only the one LB whose tags can't be read is left out, got %d of 25", len(out))
+	}
+	for _, r := range out {
+		if r.ResourceID == "arn:lb:3" {
+			t.Fatalf("lb3 must be omitted")
+		}
+	}
+	if !hasErr(errs, "elasticloadbalancing:DescribeTags (r1)") {
+		t.Fatalf("the failing ARN must still be reported: %v", errs)
+	}
+	if len(errs) != 1 {
+		t.Fatalf("one failing ARN is one error (not one per batch member): %v", errs)
+	}
+}
+
+// The SDK treats an EMPTY next token as the end of the listing. A final page that carries one must not be
+// reported as a repeated-token loop (that would drop the service from `scanned` on every scan).
+func TestAnEmptyFinalPageTokenIsTheEndNotARepeatedToken(t *testing.T) {
+	e := &fakeEC2{pages: ec2Pages(7, 5), emptyEnd: true}
+	if out, errs := collectEC2(context.Background(), "r1", e); len(errs) != 0 || len(out) != 7 {
+		t.Fatalf("ec2: want 7 and no errs, got %d / %v", len(out), errs)
+	}
+	r := &fakeRDS{pages: rdsPages(150, 100), emptyEnd: true}
+	if out, errs := collectRDS(context.Background(), "r1", r); len(errs) != 0 || len(out) != 150 {
+		t.Fatalf("rds: want 150 and no errs, got %d / %v", len(out), errs)
+	}
+	f := elbFixture(30, 20)
+	f.emptyEnd = true
+	out, errs := collectLoadBalancers(context.Background(), "r1", f)
+	if len(errs) != 0 || len(out) != 30 {
+		t.Fatalf("elb + listeners: want 30 and no errs, got %d / %v", len(out), errs)
+	}
+	if ports, err := listenerPorts(context.Background(), f, aws.String("arn:lb:0")); err != nil || len(ports) != 1 {
+		t.Fatalf("listeners: want 1 port and no error, got %v / %v", ports, err)
 	}
 }

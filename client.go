@@ -86,8 +86,14 @@ func (c *Client) Discovered(ctx context.Context, items []DiscoveredItem) error {
 	return c.do(ctx, "/agent/v1/discovered", map[string]any{"discovered": items}, nil)
 }
 
-func (c *Client) CloudResources(ctx context.Context, provider string, resources []CloudResource, errMsg string) error {
+// CloudResources pushes one discovery snapshot. scanned lists the (resource type, region) pairs whose
+// listing finished with no error; a non-nil list (even empty) tells the server it can prune per pair
+// even when errMsg is set. nil = an agent that doesn't report pairs (all-or-nothing pruning).
+func (c *Client) CloudResources(ctx context.Context, provider string, resources []CloudResource, errMsg string, scanned []ScannedPair) error {
 	body := map[string]any{"provider": provider, "resources": resources}
+	if scanned != nil {
+		body["scanned"] = scanned
+	}
 	if errMsg != "" {
 		body["error"] = errMsg
 	}
